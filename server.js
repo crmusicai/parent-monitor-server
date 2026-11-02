@@ -431,6 +431,10 @@ const server = http.createServer(async (req, res) => {
         lastSessions,
         childDebug: Object.fromEntries(childDebug),
         parentDebug: Object.fromEntries(parentDebug),
+        // Crash self-reports (v2.5.1): only children that reported one.
+        childCrash: Object.fromEntries(
+          data.children.filter(c => c.lastCrash).map(c => [c.id, c.lastCrash])
+        ),
       });
     }
 
@@ -669,6 +673,13 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       // FCM token registration/rotation: non-empty string replaces,
       // explicit empty string clears. Value is never logged.
       if (typeof body.fcmToken === 'string') child.fcmToken = body.fcmToken || null;
+      // Crash self-report (v2.5.1): the child app's last uncaught-
+      // exception trace, harvested after the crash and carried once by
+      // the next heartbeat. Truncated to 4000 chars; stored on the
+      // record and surfaced in /debug as childCrash for diagnosis.
+      if (typeof body.lastCrash === 'string' && body.lastCrash) {
+        child.lastCrash = body.lastCrash.slice(0, 4000);
+      }
       child.lastSeen = new Date().toISOString();
       save();
       return json(res, 200, { ok: true });
