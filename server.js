@@ -205,6 +205,48 @@ function findInvite(pred) {
   return Object.values(data.invites).find(pred) || null;
 }
 function chatKey(parentId, childId) { return `${parentId}:${childId}`; }
+// ---- chat v2.3 (full messenger): delete-for-me/everyone, reply/quote,
+//      read receipts, typing. Party keys in deletedFor/readBy use the ids
+//      already on every stored message: the parent party is keyed by its
+//      parentId, the child party by its childId.
+// Wire shape of a chat message (history + chat_msg relay): the stored fields
+// minus the internal deletedFor/readBy lists, plus a viewer-independent
+// `read` flag — true once the message's RECIPIENT (the party that did not
+// send it) has marked the pair read via POST /api/chat/read.
+function chatView(msg) {
+  const recipientKey = msg.fromRole === 'parent' ? msg.childId : msg.parentId;
+  return {
+    id: msg.id, parentId: msg.parentId, childId: msg.childId,
+    fromRole: msg.fromRole, kind: msg.kind, body: msg.body, mediaId: msg.mediaId,
+    ts: msg.ts,
+    replyTo: msg.replyTo ?? null,
+    replySnippet: msg.replySnippet ?? null,
+    read: Array.isArray(msg.readBy) && msg.readBy.includes(recipientKey),
+  };
+}
+function chatHistoryFor(parentId, childId, viewerKey) {
+  const arr = data.chats[chatKey(parentId, childId)] || [];
+  return arr
+    .filter(m => !(Array.isArray(m.deletedFor) && m.deletedFor.includes(viewerKey)))
+    .map(chatView);
+}
+// Push a chat event to every live socket of BOTH parties of a pair (parent
+// hub sockets + the child socket). Used for chat_delete: the other party
+// updates live, and the requester's own other sockets stay in sync.
+function pushChatEvent(parentId, childId, obj) {
+  const set = liveParents.get(parentId);
+  if (set) for (const pws of set) sendWs(pws, obj);
+  sendWs(liveChildren.get(childId), obj);
+}
+// Push a chat event to the OTHER party of a pair only (chat_read, typing).
+function pushChatEventToOther(parentId, childId, fromRole, obj) {
+  if (fromRole === 'parent') {
+    sendWs(liveChildren.get(childId), obj);
+  } else {
+    const set = liveParents.get(parentId);
+    if (set) for (const pws of set) sendWs(pws, obj);
+  }
+}
 function inviteUrl(req, token) {
   const proto = req.headers['x-forwarded-proto'] || 'http';
   const host = req.headers.host || `127.0.0.1:${PORT}`;
@@ -591,11 +633,12 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       return json(res, 200, { ok: true });
     }
 
-    // ---- chat history (SPEC-V2 §2): parent by childId, child for its own pair
+    // ---- chat history (SPEC-V2 §2): parent by childId, child for its own pair.
+    //      v2.3: messages deleted-for the requester are excluded.
     if (p === '/api/chat' && req.method === 'GET') {
       const child = authChild(req);
       if (!child) return json(res, 401, { error: 'unauthorized' });
-      return json(res, 200, data.chats[chatKey(child.parentId, child.id)] || []);
+      return json(res, 200, chatHistoryFor(child.parentId, child.id, child.id));
     }
     const chatMatch = p.match(/^\/api\/chat\/([^/]+)$/);
     if (chatMatch && req.method === 'GET') {
@@ -604,7 +647,90 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       const child = data.children.find(c => c.id === decodeURIComponent(chatMatch[1]));
       if (!child) return json(res, 404, { error: 'child not found' });
       if (child.parentId !== parent.id) return json(res, 403, { error: 'forbidden' });
-      return json(res, 200, data.chats[chatKey(parent.id, child.id)] || []);
+      return json(res, 200, chatHistoryFor(parent.id, child.id, parent.id));
+    }
+
+    // ---- chat read receipts (v2.3): mark all INCOMING messages of the pair
+    //      as read by the requester; the other party gets {type:'chat_read'}.
+    //      Parent callers name the child in the body ({childId}); a child
+    //      caller's pair is implied. Response {ok, marked}.
+    if (p === '/api/chat/read' && req.method === 'POST') {
+      const parent = authParent(req);
+      const child = parent ? null : authChild(req);
+      if (!parent && !child) return json(res, 401, { error: 'unauthorized' });
+      const body = await readBody(req).catch(() => ({})) || {};
+      let parentId, childId, role, myKey;
+      if (parent) {
+        const c = data.children.find(x => x.id === String(body.childId || ''));
+        if (!c) return json(res, 404, { error: 'child not found' });
+        if (c.parentId !== parent.id) return json(res, 403, { error: 'forbidden' });
+        parentId = parent.id; childId = c.id; role = 'parent'; myKey = parent.id;
+      } else {
+        parentId = child.parentId; childId = child.id; role = 'child'; myKey = child.id;
+      }
+      let marked = 0;
+      const arr = data.chats[chatKey(parentId, childId)] || [];
+      for (const msg of arr) {
+        if (msg.fromRole === role) continue; // only incoming messages
+        if (!Array.isArray(msg.readBy)) msg.readBy = [];
+        if (!msg.readBy.includes(myKey)) { msg.readBy.push(myKey); marked++; }
+      }
+      if (marked) save();
+      pushChatEventToOther(parentId, childId, role,
+        { type: 'chat_read', parentId, childId, byRole: role });
+      return json(res, 200, { ok: true, marked });
+    }
+
+    // ---- chat message delete (v2.3): DELETE /api/chat/messages/:id,
+    //      scope from JSON body or ?scope= ('me' default, or 'everyone').
+    //      'me'       -> requester added to the message's deletedFor; the
+    //                      message vanishes from the requester's history only.
+    //      'everyone' -> the message is hard-removed for both parties; a
+    //                      media message's stored media is deleted too when
+    //                      no other message references it (GET -> 404).
+    //      Either way {type:'chat_delete', msgId, scope} is pushed to every
+    //      live socket of both parties. A message outside the requester's
+    //      pair(s) is indistinguishable from a missing one: 404.
+    const chatMsgMatch = p.match(/^\/api\/chat\/messages\/([^/]+)$/);
+    if (chatMsgMatch && req.method === 'DELETE') {
+      const parent = authParent(req);
+      const child = parent ? null : authChild(req);
+      if (!parent && !child) return json(res, 401, { error: 'unauthorized' });
+      const body = await readBody(req).catch(() => ({})) || {};
+      const scope = String(body.scope || url.searchParams.get('scope') || 'me');
+      if (scope !== 'me' && scope !== 'everyone') return json(res, 400, { error: 'bad scope' });
+      const msgId = decodeURIComponent(chatMsgMatch[1]);
+      const myKey = parent ? parent.id : child.id;
+      // Search ONLY the requester's own pair(s) (isolation).
+      let hit = null;
+      for (const [key, arr] of Object.entries(data.chats)) {
+        const inScope = parent ? key.startsWith(parent.id + ':') : key === chatKey(child.parentId, child.id);
+        if (!inScope || !Array.isArray(arr)) continue;
+        const idx = arr.findIndex(m => m.id === msgId);
+        if (idx >= 0) { hit = { key, arr, idx, msg: arr[idx] }; break; }
+      }
+      if (!hit) return json(res, 404, { error: 'message not found' });
+      const { parentId, childId } = hit.msg;
+      if (scope === 'me') {
+        if (!Array.isArray(hit.msg.deletedFor)) hit.msg.deletedFor = [];
+        if (!hit.msg.deletedFor.includes(myKey)) hit.msg.deletedFor.push(myKey);
+        save();
+      } else {
+        const mediaId = hit.msg.mediaId;
+        hit.arr.splice(hit.idx, 1);
+        if (mediaId && data.media[mediaId]) {
+          const stillReferenced = Object.values(data.chats)
+            .some(a => Array.isArray(a) && a.some(m => m.mediaId === mediaId));
+          if (!stillReferenced) {
+            try { fs.unlinkSync(path.join(MEDIA_DIR, mediaId)); } catch {}
+            delete data.media[mediaId];
+          }
+        }
+        save();
+      }
+      pushChatEvent(parentId, childId,
+        { type: 'chat_delete', msgId, scope, parentId, childId });
+      return json(res, 200, { ok: true, msgId, scope });
     }
 
     // ---- media files (SPEC-V2 §3): upload raw bytes, owner-only download
@@ -877,23 +1003,57 @@ wss.on('connection', (ws, req) => {
         const rec = mediaId ? data.media[mediaId] : null;
         if (!rec || rec.ownerParentId !== parentId) return sendWs(ws, { type: 'chat_error', reason: 'bad_media' });
       }
+      const key = chatKey(parentId, childId);
+      const arr = data.chats[key] || (data.chats[key] = []);
+      // Reply/quote (v2.3): replyTo must name a message of THIS pair; an
+      // unknown or foreign id is ignored (stored null), never an error.
+      // The snippet is a send-time snapshot (first 80 chars of text, or
+      // 'Photo'/'File' for media), so it survives the target being deleted.
+      let replyTo = null, replySnippet = null;
+      if (m.replyTo) {
+        const target = arr.find(x => x.id === String(m.replyTo));
+        if (target) {
+          replyTo = target.id;
+          replySnippet = target.kind === 'text'
+            ? String(target.body || '').slice(0, 80)
+            : (target.kind === 'photo' ? 'Photo' : 'File');
+        }
+      }
       const msg = {
         id: crypto.randomBytes(8).toString('hex'),
         parentId, childId, fromRole: ws.role, kind,
         body: m.body == null ? '' : String(m.body).slice(0, 4000),
         mediaId, ts: new Date().toISOString(),
+        replyTo, replySnippet,
+        deletedFor: [], readBy: [],
       };
-      const key = chatKey(parentId, childId);
-      const arr = data.chats[key] || (data.chats[key] = []);
       arr.push(msg);
       if (arr.length > CHAT_CAP) data.chats[key] = arr.slice(-CHAT_CAP);
       save();
-      const out = Object.assign({ type: 'chat_msg' }, msg);
+      const out = Object.assign({ type: 'chat_msg' }, chatView(msg));
       if (ws.role === 'parent') {
         sendWs(liveChildren.get(childId), out);
       } else {
         const set = liveParents.get(parentId);
         if (set) for (const pws of set) sendWs(pws, out);
+      }
+      return;
+    }
+
+    // ---- typing indicator (v2.3): ephemeral relay to the other party only.
+    //      Never stored, never appears in history.
+    if (m.type === 'typing') {
+      if (ws.role === 'parent') {
+        const childId = String(m.childId || '');
+        const child = data.children.find(c => c.id === childId);
+        if (!child || child.parentId !== ws.parentId) return; // foreign pair: drop
+        sendWs(liveChildren.get(childId),
+          { type: 'typing', on: !!m.on, fromRole: 'parent', parentId: ws.parentId, childId });
+      } else if (ws.role === 'child') {
+        const set = liveParents.get(ws.parentId);
+        if (set) for (const pws of set) {
+          sendWs(pws, { type: 'typing', on: !!m.on, fromRole: 'child', parentId: ws.parentId, childId: ws.childId });
+        }
       }
       return;
     }
