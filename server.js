@@ -52,6 +52,8 @@ const liveChildren = new Map();  // childId -> ws
 const liveParents = new Map();   // parentId -> Set<ws>
 const sessions = new Map();      // sessionId -> {id, parentId, childId, parentWs, childWs, sig, dbg}
 const childDebug = new Map();    // childId -> [debug strings] (diagnostics, memory-only)
+const parentDebug = new Map();   // parentId -> [debug strings] (diagnostics, memory-only)
+const lastSessions = [];         // archived session summaries after close (diagnostics)
 
 // ---------------------------------------------------------------- helpers
 function json(res, code, obj) {
@@ -120,8 +122,14 @@ function findOwnChild(parent, id) {
 function sendWs(ws, obj) {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
 }
+function archiveSession(session) {
+  lastSessions.push({ id: session.id.slice(0, 8), childId: session.childId,
+    sig: session.sig, dbg: session.dbg, closedAt: new Date().toISOString() });
+  while (lastSessions.length > 5) lastSessions.shift();
+}
 function closeSession(session, notifyWsList) {
   sessions.delete(session.id);
+  archiveSession(session);
   for (const peer of notifyWsList) sendWs(peer, { type: 'session_closed', sessionId: session.id });
 }
 
@@ -143,7 +151,9 @@ const server = http.createServer(async (req, res) => {
         sessions: [...sessions.values()].map(s => ({
           id: s.id.slice(0, 8), childId: s.childId, sig: s.sig, dbg: s.dbg,
         })),
+        lastSessions,
         childDebug: Object.fromEntries(childDebug),
+        parentDebug: Object.fromEntries(parentDebug),
       });
     }
 
@@ -367,6 +377,7 @@ wss.on('connection', (ws, req) => {
       if (!s) return;
       if (ws !== s.parentWs && ws !== s.childWs) return;
       sessions.delete(s.id);
+      archiveSession(s);
       const other = ws === s.parentWs ? s.childWs : s.parentWs;
       sendWs(other, { type: 'listen_stop', sessionId: s.id });
       return;
@@ -402,10 +413,16 @@ wss.on('connection', (ws, req) => {
       if (s && (ws === s.parentWs || ws === s.childWs)) {
         s.dbg.push(`${ws.role}:${state}`);
         if (s.dbg.length > 40) s.dbg = s.dbg.slice(-40);
-      } else if (ws.role === 'child' && ws.childId) {
+      }
+      // Mirror into per-party stores too, so the trail survives session close.
+      if (ws.role === 'child' && ws.childId) {
         const arr = childDebug.get(ws.childId) || [];
         arr.push(state);
-        childDebug.set(ws.childId, arr.slice(-20));
+        childDebug.set(ws.childId, arr.slice(-30));
+      } else if (ws.role === 'parent' && ws.parentId) {
+        const arr = parentDebug.get(ws.parentId) || [];
+        arr.push(state);
+        parentDebug.set(ws.parentId, arr.slice(-30));
       }
       return;
     }
