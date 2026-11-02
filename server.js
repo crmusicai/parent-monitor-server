@@ -16,6 +16,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
+const fcm = require('./fcm');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const DATA_FILE = process.env.DATA_FILE
@@ -32,6 +33,24 @@ const MEDIA_MAX_FILES = 200;                     // stored media files kept (old
 // Ring timeout for unaccepted calls (45 s per SPEC-V2; env override exists for tests).
 const RING_TIMEOUT_MS = parseInt(process.env.RING_TIMEOUT_MS || '45000', 10);
 const MEDIA_DIR = path.join(path.dirname(DATA_FILE), 'media');
+// Presence grace (v2.4 audit round; merged from server.proposed.js, NOT
+// YET DEPLOYED). Before this change, childView.online was exactly
+// liveChildren.has(id): the instant a child's WebSocket closed — a
+// Wi-Fi<->mobile-data switch, a carrier NAT rebinding, a brief tunnel
+// drop — the parent saw "Offline", even though the child app was alive
+// and reconnecting with backoff (field report: "shows Offline suddenly
+// while actually online"). A closed socket now starts a grace window:
+// the child still reads online for up to PRESENCE_GRACE_MS while it
+// reconnects; only a child that stays gone past the window flips to
+// offline. Env override exists for tests.
+const PRESENCE_GRACE_MS = parseInt(process.env.PRESENCE_GRACE_MS || '30000', 10);
+// Server-side WS heartbeat. The ws server previously never pinged and
+// never reaped dead sockets, so a half-open child connection (network
+// vanished without a FIN) stayed "online" forever. Every WS_PING_MS
+// each client is pinged; a client that misses a full cycle is
+// terminated, which runs the normal close path (sessions end,
+// presence grace starts).
+const WS_PING_MS = parseInt(process.env.WS_PING_MS || '30000', 10);
 
 // ---------------------------------------------------------------- storage
 function blankData() {
@@ -61,11 +80,33 @@ function save() {
 
 // ---------------------------------------------------------------- live state
 const liveChildren = new Map();  // childId -> ws
+const childWentOfflineAt = new Map();  // childId -> ms when its live socket was lost (presence grace)
 const liveParents = new Map();   // parentId -> Set<ws>
 const sessions = new Map();      // sessionId -> {id, parentId, childId, parentWs, childWs, sig, dbg}
 const childDebug = new Map();    // childId -> [debug strings] (diagnostics, memory-only)
 const parentDebug = new Map();   // parentId -> [debug strings] (diagnostics, memory-only)
 const lastSessions = [];         // archived session summaries after close (diagnostics)
+
+// ---------------------------------------------------------------- FCM wake
+// When a parent-initiated action targets a child with no live socket,
+// try to wake the child's app with a high-priority FCM data push so its
+// reconnect logic can bring the socket back (the request itself still
+// fails/reports offline as before — the push is a nudge, fire-and-
+// forget, throttled per child inside the wake service). No-op when FCM
+// is unconfigured or the child never registered a token. Token values
+// are never logged.
+const wakeService = fcm.createWakeService(fcm.defaultSender(), { windowMs: 20000 });
+function childSocketOpen(childId) {
+  const cws = liveChildren.get(childId);
+  return !!cws && cws.readyState === 1;
+}
+function maybeWakeChild(child) {
+  try {
+    if (!child || !child.fcmToken) return;
+    if (childSocketOpen(child.id)) return;
+    wakeService.wake(child.id, child.fcmToken).catch(() => {});
+  } catch {}
+}
 
 // ---------------------------------------------------------------- helpers
 function json(res, code, obj) {
@@ -123,12 +164,18 @@ function authChild(req) {
   if (!token) return null;
   return data.children.find(c => c.deviceToken === token) || null;
 }
+function childOnline(c) {
+  // Live socket OR still inside the reconnect grace window.
+  if (liveChildren.has(c.id)) return true;
+  const t = childWentOfflineAt.get(c.id);
+  return t != null && (Date.now() - t) < PRESENCE_GRACE_MS;
+}
 function childView(c) {
   return {
     id: c.id,
     name: c.name,
     model: c.model,
-    online: liveChildren.has(c.id),
+    online: childOnline(c),
     lastSeen: c.lastSeen || null,
     battery: c.battery ?? null,
     permissions: c.permissions || null,
@@ -548,7 +595,7 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
     // ---- child pairing (public; credential = v1 pairing code, invite code,
     //      or invite token — SPEC-V2 §4). All are single-use.
     if (p === '/api/children/pair' && req.method === 'POST') {
-      const { code, token, name, model } = await readBody(req).catch(() => null) || {};
+      const { code, token, name, model, fcmToken } = await readBody(req).catch(() => null) || {};
       let parentId = null;
       if (token) {
         const inv = findInvite(i => i.token === String(token));
@@ -582,6 +629,7 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
         name: name ? String(name) : (model ? String(model) : 'Child'),
         model: model ? String(model) : '',
         deviceToken: newToken(),
+        fcmToken: fcmToken ? String(fcmToken) : null,
         createdAt: new Date().toISOString(),
         lastSeen: null, battery: null, permissions: null, lastLocation: null, appVersion: null,
         events: [],
@@ -618,6 +666,9 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
         };
       }
       if (body.appVersion) child.appVersion = String(body.appVersion);
+      // FCM token registration/rotation: non-empty string replaces,
+      // explicit empty string clears. Value is never logged.
+      if (typeof body.fcmToken === 'string') child.fcmToken = body.fcmToken || null;
       child.lastSeen = new Date().toISOString();
       save();
       return json(res, 200, { ok: true });
@@ -830,7 +881,21 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
 
 // ---------------------------------------------------------------- WebSocket
 const wss = new WebSocketServer({ server });
+// Heartbeat/reaper for half-open sockets (see WS_PING_MS).
+const wsPingTimer = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) { try { ws.terminate(); } catch {} continue; }
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  }
+}, WS_PING_MS);
+if (wsPingTimer.unref) wsPingTimer.unref();
 wss.on('connection', (ws, req) => {
+  // Liveness tracking for the reaper above. The ws library (and OkHttp
+  // on Android) answer protocol pings with pongs automatically; a
+  // client that stops ponging is a dead connection.
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
   const url = new URL(req.url, 'http://x');
   const role = url.searchParams.get('role');
 
@@ -851,6 +916,7 @@ wss.on('connection', (ws, req) => {
     const old = liveChildren.get(child.id);
     if (old && old !== ws) { try { old.close(); } catch {} }
     liveChildren.set(child.id, ws);
+    childWentOfflineAt.delete(child.id); // back inside the grace model
     child.lastSeen = new Date().toISOString();
     save();
     sendWs(ws, { type: 'connected', role: 'child', childId: child.id, parentId: child.parentId });
@@ -871,7 +937,7 @@ wss.on('connection', (ws, req) => {
       if (!child) return sendWs(ws, { type: 'listen_error', childId, reason: 'not_found' });
       if (child.parentId !== ws.parentId) return sendWs(ws, { type: 'listen_error', childId, reason: 'forbidden' });
       const cws = liveChildren.get(childId);
-      if (!cws || cws.readyState !== 1) return sendWs(ws, { type: 'listen_error', childId, reason: 'offline' });
+      if (!cws || cws.readyState !== 1) { maybeWakeChild(child); return sendWs(ws, { type: 'listen_error', childId, reason: 'offline' }); }
       if (partyBusy(ws.parentId, childId)) return sendWs(ws, { type: 'listen_error', childId, reason: 'busy' });
       const session = createSession({ kind: 'listen', parentId: ws.parentId, childId, parentWs: ws, childWs: cws, initiatorRole: 'parent' });
       sendWs(cws, { type: 'listen_start', sessionId: session.id, parentId: ws.parentId });
@@ -900,7 +966,7 @@ wss.on('connection', (ws, req) => {
       if (!child) return sendWs(ws, { type: 'camera_error', childId, reason: 'not_found' });
       if (child.parentId !== ws.parentId) return sendWs(ws, { type: 'camera_error', childId, reason: 'forbidden' });
       const cws = liveChildren.get(childId);
-      if (!cws || cws.readyState !== 1) return sendWs(ws, { type: 'camera_error', childId, reason: 'offline' });
+      if (!cws || cws.readyState !== 1) { maybeWakeChild(child); return sendWs(ws, { type: 'camera_error', childId, reason: 'offline' }); }
       if (partyBusy(ws.parentId, childId)) return sendWs(ws, { type: 'camera_error', childId, reason: 'busy' });
       const s = createSession({ kind: 'camera', parentId: ws.parentId, childId, parentWs: ws, childWs: cws, initiatorRole: 'parent' });
       sendWs(cws, { type: 'camera_start', sessionId: s.id, parentId: ws.parentId, facing });
@@ -941,7 +1007,7 @@ wss.on('connection', (ws, req) => {
         if (!child) return sendWs(ws, { type: 'call_error', childId, reason: 'not_found' });
         if (child.parentId !== ws.parentId) return sendWs(ws, { type: 'call_error', childId, reason: 'forbidden' });
         const cws = liveChildren.get(childId);
-        if (!cws || cws.readyState !== 1) return sendWs(ws, { type: 'call_error', childId, reason: 'offline' });
+        if (!cws || cws.readyState !== 1) { maybeWakeChild(child); return sendWs(ws, { type: 'call_error', childId, reason: 'offline' }); }
         if (partyBusy(ws.parentId, childId)) return sendWs(ws, { type: 'call_busy', childId });
         const s = createSession({ kind: 'call', state: 'ringing', media, parentId: ws.parentId, childId, parentWs: ws, childWs: cws, initiatorRole: 'parent' });
         armRingTimer(s);
@@ -1057,6 +1123,11 @@ wss.on('connection', (ws, req) => {
       const out = Object.assign({ type: 'chat_msg' }, chatView(msg));
       if (ws.role === 'parent') {
         sendWs(liveChildren.get(childId), out);
+        // Message is stored regardless; if the child is not connected,
+        // nudge its app awake so it can fetch/react (fire-and-forget).
+        // (The validated `child` const above is block-scoped to the
+        // role check, so re-resolve the record here.)
+        maybeWakeChild(data.children.find(c => c.id === childId));
       } else {
         const set = liveParents.get(parentId);
         if (set) for (const pws of set) sendWs(pws, out);
@@ -1171,7 +1242,12 @@ wss.on('connection', (ws, req) => {
       }
     }
     if (ws.role === 'child') {
-      if (liveChildren.get(ws.childId) === ws) liveChildren.delete(ws.childId);
+      if (liveChildren.get(ws.childId) === ws) {
+        liveChildren.delete(ws.childId);
+        // Presence does not flip offline yet — the grace window in
+        // childOnline() covers the app's reconnect backoff.
+        childWentOfflineAt.set(ws.childId, Date.now());
+      }
       const child = data.children.find(c => c.id === ws.childId);
       if (child) { child.lastSeen = new Date().toISOString(); save(); }
       for (const s of [...sessions.values()]) {
