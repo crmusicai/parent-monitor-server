@@ -50,7 +50,8 @@ function save() {
 // ---------------------------------------------------------------- live state
 const liveChildren = new Map();  // childId -> ws
 const liveParents = new Map();   // parentId -> Set<ws>
-const sessions = new Map();      // sessionId -> {id, parentId, childId, parentWs, childWs}
+const sessions = new Map();      // sessionId -> {id, parentId, childId, parentWs, childWs, sig, dbg}
+const childDebug = new Map();    // childId -> [debug strings] (diagnostics, memory-only)
 
 // ---------------------------------------------------------------- helpers
 function json(res, code, obj) {
@@ -132,6 +133,18 @@ const server = http.createServer(async (req, res) => {
     // ---- server
     if (p === '/health' && req.method === 'GET') {
       return json(res, 200, { ok: true, parents: data.parents.length, children: data.children.length, online: liveChildren.size });
+    }
+
+    // ---- diagnostics (counts + state words only; no SDP bodies, no IPs)
+    if (p === '/debug' && req.method === 'GET') {
+      return json(res, 200, {
+        ok: true,
+        parents: data.parents.length, children: data.children.length, online: liveChildren.size,
+        sessions: [...sessions.values()].map(s => ({
+          id: s.id.slice(0, 8), childId: s.childId, sig: s.sig, dbg: s.dbg,
+        })),
+        childDebug: Object.fromEntries(childDebug),
+      });
     }
 
     // ---- parent auth
@@ -341,7 +354,8 @@ wss.on('connection', (ws, req) => {
       const cws = liveChildren.get(childId);
       if (!cws || cws.readyState !== 1) return sendWs(ws, { type: 'listen_error', childId, reason: 'offline' });
       const sessionId = crypto.randomBytes(16).toString('hex');
-      sessions.set(sessionId, { id: sessionId, parentId: ws.parentId, childId, parentWs: ws, childWs: cws });
+      sessions.set(sessionId, { id: sessionId, parentId: ws.parentId, childId, parentWs: ws, childWs: cws,
+        sig: { offer: 0, answer: 0, childIce: {}, parentIce: {} }, dbg: [] });
       sendWs(cws, { type: 'listen_start', sessionId, parentId: ws.parentId });
       sendWs(ws, { type: 'listen_ready', sessionId, childId });
       return;
@@ -363,8 +377,36 @@ wss.on('connection', (ws, req) => {
       const s = sessions.get(m.sessionId);
       if (!s) return sendWs(ws, { type: 'error', error: 'no such session' });
       if (ws !== s.parentWs && ws !== s.childWs) return;
+      // Diagnostics tallies: message kinds + ICE candidate TYPES only.
+      try {
+        const pl = m.payload || {};
+        if (pl.kind === 'offer') s.sig.offer++;
+        else if (pl.kind === 'answer') s.sig.answer++;
+        else if (pl.kind === 'ice') {
+          const tmatch = / typ ([a-z]+)/.exec(String(pl.candidate || ''));
+          const t = tmatch ? tmatch[1] : 'unknown';
+          const bucket = ws === s.childWs ? s.sig.childIce : s.sig.parentIce;
+          bucket[t] = (bucket[t] || 0) + 1;
+        }
+      } catch {}
       const peer = ws === s.parentWs ? s.childWs : s.parentWs;
       sendWs(peer, { type: 'signal', sessionId: s.id, payload: m.payload });
+      return;
+    }
+
+    // ---- RTC diagnostics from either party (short state words only)
+    if (m.type === 'rtc_debug') {
+      const state = String(m.state || '').slice(0, 80);
+      if (!state) return;
+      const s = sessions.get(m.sessionId);
+      if (s && (ws === s.parentWs || ws === s.childWs)) {
+        s.dbg.push(`${ws.role}:${state}`);
+        if (s.dbg.length > 40) s.dbg = s.dbg.slice(-40);
+      } else if (ws.role === 'child' && ws.childId) {
+        const arr = childDebug.get(ws.childId) || [];
+        arr.push(state);
+        childDebug.set(ws.childId, arr.slice(-20));
+      }
       return;
     }
 
