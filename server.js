@@ -976,8 +976,32 @@ wss.on('connection', (ws, req) => {
       return;
     }
     if (m.type === 'call_reject' || m.type === 'call_end' || m.type === 'call_cancel') {
-      const s = sessions.get(m.sessionId);
-      if (!s || s.kind !== 'call') return;
+      let s = sessions.get(m.sessionId);
+      if (!s || s.kind !== 'call') {
+        // v2.3.3: the INITIATOR never learns the sessionId while the call
+        // is still ringing (it is only revealed in call_accepted), so a
+        // ringing-phase call_cancel / call_end from the caller arrives
+        // with no usable id and used to be dropped here — the callee kept
+        // ringing until the 45 s timeout. Resolve the pair's current call
+        // session from the AUTHENTICATED sender instead: a parent sender
+        // is matched by parentId (and by m.childId when it names one), a
+        // child sender by its own childId. partyBusy() guarantees at most
+        // one live session per pair, so this cannot cross pairs; the
+        // isParty check below still applies to the resolved session.
+        s = undefined;
+        for (const cand of sessions.values()) {
+          if (cand.kind !== 'call') continue;
+          if (ws.role === 'parent') {
+            if (cand.parentId !== ws.parentId) continue;
+            if (m.childId && cand.childId !== String(m.childId)) continue;
+          } else if (ws.role === 'child') {
+            if (cand.childId !== ws.childId) continue;
+          } else continue;
+          if (cand.state === 'ringing') { s = cand; break; }
+          if (!s) s = cand;
+        }
+        if (!s) return;
+      }
       const isParty = ws === s.parentWs || ws === s.childWs ||
         (s.initiatorRole === 'child' && ws.role === 'parent' && ws.parentId === s.parentId);
       if (!isParty) return;
