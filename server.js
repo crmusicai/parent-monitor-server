@@ -756,7 +756,11 @@ function authParent(req) {
   const token = h.startsWith('Bearer ') ? h.slice(7) : '';
   const parentId = token ? data.tokens[token] : null;
   if (!parentId) return null;
-  return data.parents.find(p => p.id === parentId) || null;
+  const parent = data.parents.find(p => p.id === parentId) || null;
+  // Owner order 2026-11-20: old-version parent accounts are disabled
+  // server-side (parent.blocked). Only current-version accounts serve.
+  if (parent && parent.blocked) return null;
+  return parent;
 }
 function authChild(req) {
   const h = req.headers['authorization'] || '';
@@ -1447,6 +1451,7 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       const { phone, password, fcmToken } = await readBody(req).catch(() => null) || {};
       const parent = data.parents.find(x => x.phone === String(phone || ''));
       if (!parent || !checkPassword(password || '', parent)) return json(res, 401, { error: 'bad credentials' });
+      if (parent.blocked) return json(res, 403, { error: 'account_disabled', message: 'এই account-এর পুরোনো version বন্ধ করা হয়েছে। সেবা চালু রাখতে ডেভলপারের সাথে যোগাযোগ করুন: 01713-439594' });
       // Parent FCM token registration/rotation (step-3): non-empty
       // string replaces, explicit empty string clears. Never logged.
       if (typeof fcmToken === 'string') parent.fcmToken = fcmToken || null;
@@ -1459,6 +1464,40 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       const parent = authParent(req);
       if (!parent) return json(res, 401, { error: 'unauthorized' });
       return json(res, 200, { parentId: parent.id, name: parent.name, phone: parent.phone });
+    }
+
+    // ---- admin: old-version account block (owner order 2026-11-20)
+    // Proof header x-admin-proof = trialHmac('admin:block') — the same
+    // trust level as the trial registry; no new secret is introduced.
+    // Flags are per-account and reversible via /api/admin/unblock.
+    if (p === '/api/admin/block-old' && req.method === 'POST') {
+      if ((req.headers['x-admin-proof'] || '') !== trialHmac('admin:block')) return json(res, 401, { error: 'unauthorized' });
+      const { before } = await readBody(req).catch(() => null) || {};
+      const cut = Date.parse(before || '');
+      if (!cut) return json(res, 400, { error: 'before (ISO date) required' });
+      let n = 0;
+      for (const par of data.parents) {
+        if (!par.blocked && Date.parse(par.createdAt || 0) < cut) {
+          par.blocked = true; par.blockedAt = new Date().toISOString(); n++;
+          for (const [tk, pid] of Object.entries(data.tokens)) if (pid === par.id) delete data.tokens[tk];
+          const set = liveParents.get(par.id);
+          if (set) for (const s of set) { try { s.close(4403); } catch {} }
+        }
+      }
+      if (n) save();
+      return json(res, 200, { ok: true, blockedNow: n, blockedTotal: data.parents.filter(x => x.blocked).length });
+    }
+    if (p === '/api/admin/unblock' && req.method === 'POST') {
+      if ((req.headers['x-admin-proof'] || '') !== trialHmac('admin:block')) return json(res, 401, { error: 'unauthorized' });
+      const { phone } = await readBody(req).catch(() => null) || {};
+      const par = data.parents.find(x => x.phone === String(phone || ''));
+      if (!par) return json(res, 404, { error: 'not found' });
+      const was = !!par.blocked; delete par.blocked; delete par.blockedAt; save();
+      return json(res, 200, { ok: true, wasBlocked: was });
+    }
+    if (p === '/api/admin/blocked-count' && req.method === 'GET') {
+      if ((req.headers['x-admin-proof'] || '') !== trialHmac('admin:block')) return json(res, 401, { error: 'unauthorized' });
+      return json(res, 200, { ok: true, blockedTotal: data.parents.filter(x => x.blocked).length, parents: data.parents.length });
     }
 
     // ---- online license ledger (parent auth; 2026-11-20)
@@ -2134,6 +2173,7 @@ wss.on('connection', (ws, req) => {
     const parentId = data.tokens[token];
     const parent = parentId && data.parents.find(p => p.id === parentId);
     if (!parent) { sendWs(ws, { type: 'error', error: 'unauthorized' }); try { ws.close(4401); } catch {} return; }
+    if (parent.blocked) { sendWs(ws, { type: 'error', error: 'account_disabled' }); try { ws.close(4403); } catch {} return; }
     ws.role = 'parent'; ws.parentId = parent.id;
     if (!liveParents.has(parent.id)) liveParents.set(parent.id, new Set());
     liveParents.get(parent.id).add(ws);
