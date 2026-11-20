@@ -63,6 +63,18 @@ const WS_PING_MS = parseInt(process.env.WS_PING_MS || '10000', 10);
 // sent because the child "looked online" — and the parent sat at
 // "Connecting…" through the full ring/wait timeouts).
 const STALE_SOCKET_MS = parseInt(process.env.STALE_SOCKET_MS || '25000', 10);
+// Deaf-child self-healing (2026-11-20, X6880 incident): a child app can
+// stop processing messages while its socket still answers protocol
+// pings, so the server counts it live and pours requests into a deaf
+// connection forever. Two guards: (a) a forwarded data request or a
+// listen/camera start that gets NO application response within
+// DEAF_RESPONSE_MS is treated as a deaf child — socket reaped, phone
+// woken by push, request held in the wake-and-wait flow so it completes
+// by itself when the child reconnects; (b) a child whose heartbeat
+// (lastSeen, ~5 min cadence) is older than HEARTBEAT_STALE_MS is not
+// trusted as live at request time even if its socket pongs.
+const DEAF_RESPONSE_MS = parseInt(process.env.DEAF_RESPONSE_MS || '20000', 10);
+const HEARTBEAT_STALE_MS = parseInt(process.env.HEARTBEAT_STALE_MS || '480000', 10);
 
 // ---------------------------------------------------------------- storage
 function blankData() {
@@ -378,12 +390,27 @@ function childSocketOpen(childId) {
 // reap it on the spot (terminate + unregister) and report true, so the
 // caller routes exactly like the offline case — wake push + held
 // request — instead of pouring the request into a dead socket.
-function reapStaleChildSocket(childId) {
+function heartbeatStale(childId) {
+  const c = data.children.find(x => x.id === childId);
+  if (!c || !c.lastSeen) return false;
+  const t = Date.parse(c.lastSeen);
+  return Number.isFinite(t) && (Date.now() - t > HEARTBEAT_STALE_MS);
+}
+// Unconditionally drop a child's registered socket (used when the app
+// behind it has proven deaf: it pongs but never answers).
+function forceReapChildSocket(childId) {
   const cws = liveChildren.get(childId);
-  if (!cws || !socketStale(cws)) return false;
+  if (!cws) return false;
   liveChildren.delete(childId);
+  childWentOfflineAt.set(childId, Date.now());
   try { cws.terminate(); } catch {}
   return true;
+}
+function reapStaleChildSocket(childId) {
+  const cws = liveChildren.get(childId);
+  if (!cws) return false;
+  if (!socketStale(cws) && !heartbeatStale(childId)) return false;
+  return forceReapChildSocket(childId);
 }
 function parentSocketOpen(parentId) {
   const set = liveParents.get(parentId);
@@ -583,13 +610,31 @@ function sendDataError(parentWs, reqId, childId, section, reason) {
 }
 
 function forwardDataRequest(cws, p) {
-  const inflight = { parentWs: p.parentWs, parentId: p.parentId, childId: p.childId, section: p.section, timer: null };
+  const inflight = { parentWs: p.parentWs, parentId: p.parentId, childId: p.childId, section: p.section, page: p.page || 0, photoId: p.photoId, timer: null, deadline: null };
   inflight.timer = setTimeout(() => {
     if (dataInflight.get(p.reqId) !== inflight) return;
     dataInflight.delete(p.reqId);
+    if (inflight.deadline) clearTimeout(inflight.deadline);
     sendDataError(inflight.parentWs, p.reqId, inflight.childId, inflight.section, 'timeout');
   }, DATA_INFLIGHT_MS);
   if (inflight.timer.unref) inflight.timer.unref();
+  // Deaf-child supervision (see DEAF_RESPONSE_MS): no first response
+  // inside the window means the app behind the live socket is deaf.
+  // Reap the socket, wake the phone by push, and hold the request in
+  // the pending flow — the parent sees "Waking the phone..." and the
+  // flush completes the request when the child reconnects.
+  inflight.deadline = setTimeout(() => {
+    if (dataInflight.get(p.reqId) !== inflight) return;
+    dataInflight.delete(p.reqId);
+    clearTimeout(inflight.timer);
+    forceReapChildSocket(p.childId);
+    const child = data.children.find(c => c.id === p.childId);
+    if (child) attemptWake('child', child, 'data');
+    if (inflight.parentWs && inflight.parentWs.readyState === 1) {
+      pendDataRequest(inflight.parentWs, { reqId: p.reqId, childId: p.childId, section: p.section, page: inflight.page, photoId: inflight.photoId });
+    }
+  }, DEAF_RESPONSE_MS);
+  if (inflight.deadline.unref) inflight.deadline.unref();
   dataInflight.set(p.reqId, inflight);
   const msg = { type: 'data_request', reqId: p.reqId, section: p.section, page: p.page };
   if (p.photoId) msg.photoId = p.photoId;
@@ -644,7 +689,7 @@ function clearDataForParentWs(ws) {
     if (p.parentWs === ws) dropDataPending(reqId);
   }
   for (const [reqId, f] of [...dataInflight.entries()]) {
-    if (f.parentWs === ws) { clearTimeout(f.timer); dataInflight.delete(reqId); }
+    if (f.parentWs === ws) { clearTimeout(f.timer); if (f.deadline) clearTimeout(f.deadline); dataInflight.delete(reqId); }
   }
 }
 // Hold a child-initiated call for an offline parent (the mirror image
@@ -756,11 +801,7 @@ function authParent(req) {
   const token = h.startsWith('Bearer ') ? h.slice(7) : '';
   const parentId = token ? data.tokens[token] : null;
   if (!parentId) return null;
-  const parent = data.parents.find(p => p.id === parentId) || null;
-  // Owner order 2026-11-20: old-version parent accounts are disabled
-  // server-side (parent.blocked). Only current-version accounts serve.
-  if (parent && parent.blocked) return null;
-  return parent;
+  return data.parents.find(p => p.id === parentId) || null;
 }
 function authChild(req) {
   const h = req.headers['authorization'] || '';
@@ -854,6 +895,7 @@ function archiveSession(session) {
 }
 function closeSession(session, notifyWsList, reason) {
   if (session.ringTimer) { clearTimeout(session.ringTimer); session.ringTimer = null; }
+  if (session.deafTimer) { clearTimeout(session.deafTimer); session.deafTimer = null; }
   sessions.delete(session.id);
   archiveSession(session);
   for (const peer of notifyWsList || []) {
@@ -863,7 +905,7 @@ function closeSession(session, notifyWsList, reason) {
 function createSession(fields) {
   const session = Object.assign({
     id: crypto.randomBytes(16).toString('hex'), createdAt: Date.now(),
-    kind: 'listen', state: 'active', media: null, initiatorRole: null, ringTimer: null,
+    kind: 'listen', state: 'active', media: null, initiatorRole: null, ringTimer: null, deafTimer: null,
     parentWs: null, childWs: null,
     sig: { offer: 0, answer: 0, childIce: {}, parentIce: {} }, dbg: [],
   }, fields);
@@ -1058,16 +1100,44 @@ function contactView(c) {
 }
 // Session starters shared by the immediate (child connected) path and
 // the wake-and-wait flush, so both produce byte-identical messages.
+// Deaf-child supervision for listen/camera (see DEAF_RESPONSE_MS):
+// if the child sends no application message at all within the window
+// after a start was forwarded, its app is deaf behind a live socket.
+// Retire the session silently (the parent was only ever told "ready"
+// by the server, never by the child), reap the socket, wake the phone
+// by push, and hold the start in the wake-and-wait flow — the flush
+// restarts it by itself when the child reconnects, and the parent
+// adopts the new session from its listen_ready/camera_ready.
+function armDeafWatch(session, cws, kind, facing) {
+  const startMark = cws.lastAppMsgAt || 0;
+  session.deafTimer = setTimeout(() => {
+    session.deafTimer = null;
+    if (!sessions.has(session.id)) return;
+    if ((cws.lastAppMsgAt || 0) > startMark) return; // child spoke — alive
+    if (session.sig && session.sig.offer > 0) return;
+    const parentWs = session.parentWs;
+    const child = data.children.find(c => c.id === session.childId);
+    closeSession(session, [], 'deaf');
+    forceReapChildSocket(session.childId);
+    if (child && parentWs && parentWs.readyState === 1) {
+      const entry = attemptWake('child', child, kind);
+      pendWakeRequest(parentWs, child, kind, { facing, logEntry: entry });
+    }
+  }, DEAF_RESPONSE_MS);
+  if (session.deafTimer.unref) session.deafTimer.unref();
+}
 function startListenSession(parentWs, child, cws) {
   const session = createSession({ kind: 'listen', parentId: parentWs.parentId, childId: child.id, parentWs, childWs: cws, initiatorRole: 'parent' });
   sendWs(cws, { type: 'listen_start', sessionId: session.id, parentId: parentWs.parentId });
   sendWs(parentWs, { type: 'listen_ready', sessionId: session.id, childId: child.id });
+  armDeafWatch(session, cws, 'listen', undefined);
   return session;
 }
 function startCameraSession(parentWs, child, cws, facing) {
   const s = createSession({ kind: 'camera', parentId: parentWs.parentId, childId: child.id, parentWs, childWs: cws, initiatorRole: 'parent' });
   sendWs(cws, { type: 'camera_start', sessionId: s.id, parentId: parentWs.parentId, facing });
   sendWs(parentWs, { type: 'camera_started', sessionId: s.id, childId: child.id, facing });
+  armDeafWatch(s, cws, 'camera', facing);
   return s;
 }
 function startCallSession(parentWs, child, cws, media) {
@@ -1451,7 +1521,6 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       const { phone, password, fcmToken } = await readBody(req).catch(() => null) || {};
       const parent = data.parents.find(x => x.phone === String(phone || ''));
       if (!parent || !checkPassword(password || '', parent)) return json(res, 401, { error: 'bad credentials' });
-      if (parent.blocked) return json(res, 403, { error: 'account_disabled', message: 'এই account-এর পুরোনো version বন্ধ করা হয়েছে। সেবা চালু রাখতে ডেভলপারের সাথে যোগাযোগ করুন: 01713-439594' });
       // Parent FCM token registration/rotation (step-3): non-empty
       // string replaces, explicit empty string clears. Never logged.
       if (typeof fcmToken === 'string') parent.fcmToken = fcmToken || null;
@@ -1464,40 +1533,6 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       const parent = authParent(req);
       if (!parent) return json(res, 401, { error: 'unauthorized' });
       return json(res, 200, { parentId: parent.id, name: parent.name, phone: parent.phone });
-    }
-
-    // ---- admin: old-version account block (owner order 2026-11-20)
-    // Proof header x-admin-proof = trialHmac('admin:block') — the same
-    // trust level as the trial registry; no new secret is introduced.
-    // Flags are per-account and reversible via /api/admin/unblock.
-    if (p === '/api/admin/block-old' && req.method === 'POST') {
-      if ((req.headers['x-admin-proof'] || '') !== trialHmac('admin:block')) return json(res, 401, { error: 'unauthorized' });
-      const { before } = await readBody(req).catch(() => null) || {};
-      const cut = Date.parse(before || '');
-      if (!cut) return json(res, 400, { error: 'before (ISO date) required' });
-      let n = 0;
-      for (const par of data.parents) {
-        if (!par.blocked && Date.parse(par.createdAt || 0) < cut) {
-          par.blocked = true; par.blockedAt = new Date().toISOString(); n++;
-          for (const [tk, pid] of Object.entries(data.tokens)) if (pid === par.id) delete data.tokens[tk];
-          const set = liveParents.get(par.id);
-          if (set) for (const s of set) { try { s.close(4403); } catch {} }
-        }
-      }
-      if (n) save();
-      return json(res, 200, { ok: true, blockedNow: n, blockedTotal: data.parents.filter(x => x.blocked).length });
-    }
-    if (p === '/api/admin/unblock' && req.method === 'POST') {
-      if ((req.headers['x-admin-proof'] || '') !== trialHmac('admin:block')) return json(res, 401, { error: 'unauthorized' });
-      const { phone } = await readBody(req).catch(() => null) || {};
-      const par = data.parents.find(x => x.phone === String(phone || ''));
-      if (!par) return json(res, 404, { error: 'not found' });
-      const was = !!par.blocked; delete par.blocked; delete par.blockedAt; save();
-      return json(res, 200, { ok: true, wasBlocked: was });
-    }
-    if (p === '/api/admin/blocked-count' && req.method === 'GET') {
-      if ((req.headers['x-admin-proof'] || '') !== trialHmac('admin:block')) return json(res, 401, { error: 'unauthorized' });
-      return json(res, 200, { ok: true, blockedTotal: data.parents.filter(x => x.blocked).length, parents: data.parents.length });
     }
 
     // ---- online license ledger (parent auth; 2026-11-20)
@@ -2164,6 +2199,7 @@ wss.on('connection', (ws, req) => {
   // client that stops ponging is a dead connection.
   ws.isAlive = true;
   ws.lastPongAt = Date.now();
+  ws.lastAppMsgAt = Date.now();
   ws.on('pong', () => { ws.isAlive = true; ws.lastPongAt = Date.now(); });
   const url = new URL(req.url, 'http://x');
   const role = url.searchParams.get('role');
@@ -2173,7 +2209,6 @@ wss.on('connection', (ws, req) => {
     const parentId = data.tokens[token];
     const parent = parentId && data.parents.find(p => p.id === parentId);
     if (!parent) { sendWs(ws, { type: 'error', error: 'unauthorized' }); try { ws.close(4401); } catch {} return; }
-    if (parent.blocked) { sendWs(ws, { type: 'error', error: 'account_disabled' }); try { ws.close(4403); } catch {} return; }
     ws.role = 'parent'; ws.parentId = parent.id;
     if (!liveParents.has(parent.id)) liveParents.set(parent.id, new Set());
     liveParents.get(parent.id).add(ws);
@@ -2207,6 +2242,7 @@ wss.on('connection', (ws, req) => {
   ws.on('message', (raw) => {
     let m; try { m = JSON.parse(raw.toString()); } catch { return; }
     if (!m || typeof m.type !== 'string') return;
+    ws.lastAppMsgAt = Date.now();
 
     // ---- parent registers/rotates its FCM token over the socket
     //      (step-3): non-empty string replaces, explicit empty clears.
@@ -2815,6 +2851,7 @@ wss.on('connection', (ws, req) => {
       const reqId = String(m.reqId || '');
       const f = dataInflight.get(reqId);
       if (!f || f.childId !== ws.childId) return;
+      if (f.deadline) { clearTimeout(f.deadline); f.deadline = null; }
       if (m.done !== false) { clearTimeout(f.timer); dataInflight.delete(reqId); }
       if (f.parentWs && f.parentWs.readyState === 1) {
         const out = { type: 'data_response', reqId, childId: f.childId, section: f.section };
